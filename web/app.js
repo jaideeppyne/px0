@@ -830,6 +830,49 @@
       sessionStorage.setItem("px0.openDirs", JSON.stringify(Array.from(openDirs)));
     } catch {}
   }
+  async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}) {
+    const dirRows = treeEl.querySelectorAll(".tr.dir");
+    for (const dirRow of dirRows) {
+      const p = dirRow.dataset.dir;
+      dirRow.classList.toggle("dirty", !!dirtyDirs[p]);
+    }
+    const dirtyFiles = treeEl.querySelectorAll(".tr.file.dirty");
+    for (const fileRow of dirtyFiles) {
+      const p = fileRow.dataset.file;
+      if (!statuses[p]) {
+        fileRow.classList.remove("dirty", "git-M", "git-A", "git-D", "git-untracked", "git-R");
+        const badge = fileRow.querySelector(".gs");
+        if (badge)
+          badge.remove();
+      }
+    }
+    for (const [p, code] of Object.entries(statuses)) {
+      const fileRow = treeEl.querySelector('[data-file="' + CSS.escape(p) + '"]');
+      if (!fileRow)
+        continue;
+      const g = GIT_STATUS[code];
+      fileRow.classList.remove("git-M", "git-A", "git-D", "git-untracked", "git-R");
+      if (g) {
+        fileRow.classList.add("dirty", g[0]);
+        let badge = fileRow.querySelector(".gs");
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.className = "gs";
+          fileRow.appendChild(badge);
+        }
+        badge.title = "git: " + g[1];
+        badge.textContent = code;
+      } else {
+        fileRow.classList.remove("dirty");
+        const badge = fileRow.querySelector(".gs");
+        if (badge)
+          badge.remove();
+      }
+    }
+    if (treeEl.classList.contains("changed-only")) {
+      await expandDirtyDirs();
+    }
+  }
   function updateSidebarToggleState() {
     const btnChanged = $("#btn-changed");
     const hasGitChanges = !!(S2.meta?.git && S2.meta.gitChanges > 0);
@@ -2873,6 +2916,7 @@
     } else {
       d.diffMode = mode;
       d.diffDismissed = false;
+      d.openedInDiffView = true;
       setLayoutPref(mode);
     }
     syncPreview();
@@ -3928,7 +3972,8 @@
         gutter: null,
         diffMode: hasDiff ? layoutPref() || "split" : null,
         diffAvailable: hasDiff,
-        diffDismissed: false
+        diffDismissed: false,
+        openedInDiffView: hasDiff
       };
       if (!isImg) {
         for (let i = 0;i < j.lines.length; i++)
@@ -3954,6 +3999,7 @@
     if (d && d.diffAvailable && (treeEl?.classList.contains("changed-only") || !d.diffDismissed && d.diffMode === null)) {
       d.diffMode = layoutPref() || "split";
       d.diffDismissed = false;
+      d.openedInDiffView = true;
     }
     $("#empty").hidden = true;
     syncImageView();
@@ -3989,6 +4035,7 @@
       d.diffAvailable = !!j.available;
       if (j.available && d.diffMode === null && !d.diffDismissed) {
         d.diffMode = layoutPref() || "split";
+        d.openedInDiffView = true;
         if (doc_() === d) {
           syncDiffView();
           syncPreview();
@@ -4073,6 +4120,7 @@
         diffMode,
         diffAvailable: hasDiff,
         diffDismissed: !!keep.diffDismissed || !keep.diffMode,
+        openedInDiffView: !!keep.openedInDiffView || !!keep.diffMode,
         diffScroll: keep === activeDoc && keep.diffMode ? diffScrollTop() : 0
       };
       for (let k = 0;k < j.lines.length; k++) {
@@ -4143,7 +4191,11 @@
       saveWorkspaceState();
       return;
     }
-    S2.active = Math.min(i, S2.tabs.length - 1);
+    if (i < S2.active) {
+      S2.active--;
+    } else if (i === S2.active) {
+      S2.active = Math.min(i, S2.tabs.length - 1);
+    }
     const d = doc_();
     syncImageView();
     syncPreview();
@@ -4188,6 +4240,7 @@
     if (curDoc && curDoc.diffAvailable && (treeEl?.classList.contains("changed-only") || !curDoc.diffDismissed && curDoc.diffMode === null)) {
       curDoc.diffMode = layoutPref() || "split";
       curDoc.diffDismissed = false;
+      curDoc.openedInDiffView = true;
     }
     syncImageView();
     syncPreview();
@@ -7474,6 +7527,122 @@
     });
   }
 
+  // web/src/gitstream.js
+  var eventSource = null;
+  var reconnectTimer = null;
+  function initGitStream() {
+    if (!S2.meta?.git)
+      return;
+    connect();
+    window.addEventListener("focus", () => {
+      if (document.visibilityState === "visible") {
+        if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+          connect();
+        }
+        triggerRefresh();
+      }
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        disconnect();
+      } else {
+        connect();
+        triggerRefresh();
+      }
+    });
+  }
+  async function triggerRefresh() {
+    if (!S2.meta?.git)
+      return;
+    try {
+      const data = await apiPost("/api/git/refresh");
+      await handleGitStatus(data);
+    } catch (e) {}
+  }
+  function connect() {
+    if (eventSource && eventSource.readyState !== EventSource.CLOSED)
+      return;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    try {
+      eventSource = new EventSource("/api/git/stream");
+      eventSource.addEventListener("git-status", async (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          await handleGitStatus(data);
+        } catch (err) {}
+      });
+      eventSource.onerror = () => {
+        disconnect();
+        if (document.visibilityState === "visible") {
+          reconnectTimer = setTimeout(connect, 3000);
+        }
+      };
+    } catch (err) {}
+  }
+  function disconnect() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+  }
+  async function handleGitStatus(data) {
+    if (!data)
+      return;
+    if (data.gitChanges !== undefined)
+      S2.meta.gitChanges = data.gitChanges;
+    if (data.gitFiles !== undefined)
+      S2.meta.gitFiles = data.gitFiles;
+    updateSidebarToggleState();
+    if (treeEl?.classList.contains("changed-only") && (!S2.meta?.gitChanges || S2.meta.gitChanges <= 0)) {
+      await setSidebarMode("files");
+    }
+    const statuses = data.statuses || {};
+    const dirtyDirs = data.dirtyDirs || {};
+    await patchTreeGitStatus(statuses, dirtyDirs);
+    for (let i = S2.tabs.length - 1;i >= 0; i--) {
+      const t = S2.tabs[i];
+      const code = statuses[t.path];
+      const isDiff = !!code && code !== "U";
+      const wasDiff = !!(t.diffMode || t.openedInDiffView);
+      if (wasDiff && (t.diffAvailable || t.diffMode) && !isDiff) {
+        closeTab(i);
+      }
+    }
+    let tabsChanged = false;
+    for (const t of S2.tabs) {
+      const code = statuses[t.path];
+      const isDiff = !!code && code !== "U";
+      if (t.diffAvailable !== isDiff) {
+        t.diffAvailable = isDiff;
+        tabsChanged = true;
+      }
+    }
+    if (tabsChanged) {
+      drawTabs();
+    }
+    const curDoc = doc_();
+    if (curDoc) {
+      const curCode = statuses[curDoc.path];
+      const hasDiff = !!curCode && curCode !== "U";
+      if (curDoc.diffAvailable !== hasDiff || curCode) {
+        curDoc.diffAvailable = hasDiff;
+        await loadGutter(curDoc);
+        render();
+        if (curDoc.diffMode) {
+          syncDiffView(true);
+        }
+        updateStatus();
+      }
+    }
+  }
+
   // web/src/main.js
   initRenderer();
   initTabs();
@@ -7529,6 +7698,7 @@
       restoreOpenDirs(savedDirs);
     } catch {}
     await refreshTree();
+    initGitStream();
     const hasGitChanges = !!(S2.meta?.git && S2.meta.gitChanges > 0);
     if (hasGitChanges) {
       await setSidebarMode("git");

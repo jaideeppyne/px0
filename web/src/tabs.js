@@ -44,6 +44,7 @@ export async function openFile(path, opts = {}) {
       diffMode: hasDiff ? (layoutPref() || 'split') : null,
       diffAvailable: hasDiff,
       diffDismissed: false,
+      openedInDiffView: hasDiff,
     };
     if (!isImg) {
       for (let i = 0; i < j.lines.length; i++) d.lines[j.start + i] = j.lines[i];
@@ -62,6 +63,7 @@ export async function openFile(path, opts = {}) {
   if (d && d.diffAvailable && (treeEl?.classList.contains('changed-only') || (!d.diffDismissed && d.diffMode === null))) {
     d.diffMode = layoutPref() || 'split';
     d.diffDismissed = false;
+    d.openedInDiffView = true;
   }
 
   $('#empty').hidden = true;
@@ -96,6 +98,7 @@ export async function loadGutter(d) {
     d.diffAvailable = !!j.available;
     if (j.available && d.diffMode === null && !d.diffDismissed) {
       d.diffMode = layoutPref() || 'split';
+      d.openedInDiffView = true;
       if (doc_() === d) {
         syncDiffView();
         syncPreview();
@@ -192,6 +195,7 @@ export async function reloadOpenTabs() {
       diffMode,
       diffAvailable: hasDiff,
       diffDismissed: !!keep.diffDismissed || !keep.diffMode,
+      openedInDiffView: !!keep.openedInDiffView || !!keep.diffMode,
       diffScroll: keep === activeDoc && keep.diffMode ? diffScrollTop() : 0,
     };
 
@@ -265,7 +269,11 @@ export function closeTab(i) {
     saveWorkspaceState();
     return;
   }
-  S.active = Math.min(i, S.tabs.length - 1);
+  if (i < S.active) {
+    S.active--;
+  } else if (i === S.active) {
+    S.active = Math.min(i, S.tabs.length - 1);
+  }
   const d = doc_();
   syncImageView();
   syncPreview();
@@ -309,6 +317,7 @@ export function switchTab(i) {
   if (curDoc && curDoc.diffAvailable && (treeEl?.classList.contains('changed-only') || (!curDoc.diffDismissed && curDoc.diffMode === null))) {
     curDoc.diffMode = layoutPref() || 'split';
     curDoc.diffDismissed = false;
+    curDoc.openedInDiffView = true;
   }
   syncImageView();
   syncPreview();

@@ -437,6 +437,7 @@ type agentManager struct {
 	models   map[string]string // harness name -> selected model
 	jobs     map[int64]*agentJob
 	seq      int64
+	onEdit   func()
 }
 
 // newAgentManager wires discovery and restores the remembered choice. A flag
@@ -1005,6 +1006,9 @@ func (m *agentManager) settle(changed []string) {
 		if m.lsp != nil {
 			m.lsp.CloseDoc(abs, rel)
 		}
+	}
+	if len(changed) > 0 && m.onEdit != nil {
+		m.onEdit()
 	}
 }
 

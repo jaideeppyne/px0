@@ -138,6 +138,54 @@ export async function expandDirtyDirs(container = treeEl) {
   } catch {}
 }
 
+export async function patchTreeGitStatus(statuses = {}, dirtyDirs = {}) {
+  // 1. Update folder dirty classes
+  const dirRows = treeEl.querySelectorAll('.tr.dir');
+  for (const dirRow of dirRows) {
+    const p = dirRow.dataset.dir;
+    dirRow.classList.toggle('dirty', !!dirtyDirs[p]);
+  }
+
+  // 2. Clear stale dirty/status markers on files that are now clean
+  const dirtyFiles = treeEl.querySelectorAll('.tr.file.dirty');
+  for (const fileRow of dirtyFiles) {
+    const p = fileRow.dataset.file;
+    if (!statuses[p]) {
+      fileRow.classList.remove('dirty', 'git-M', 'git-A', 'git-D', 'git-untracked', 'git-R');
+      const badge = fileRow.querySelector('.gs');
+      if (badge) badge.remove();
+    }
+  }
+
+  // 3. Update or apply badges for changed files
+  for (const [p, code] of Object.entries(statuses)) {
+    const fileRow = treeEl.querySelector('[data-file="' + CSS.escape(p) + '"]');
+    if (!fileRow) continue;
+    const g = GIT_STATUS[code];
+    fileRow.classList.remove('git-M', 'git-A', 'git-D', 'git-untracked', 'git-R');
+    if (g) {
+      fileRow.classList.add('dirty', g[0]);
+      let badge = fileRow.querySelector('.gs');
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'gs';
+        fileRow.appendChild(badge);
+      }
+      badge.title = 'git: ' + g[1];
+      badge.textContent = code;
+    } else {
+      fileRow.classList.remove('dirty');
+      const badge = fileRow.querySelector('.gs');
+      if (badge) badge.remove();
+    }
+  }
+
+  // If in changed-only mode, auto-expand any newly dirty directories
+  if (treeEl.classList.contains('changed-only')) {
+    await expandDirtyDirs();
+  }
+}
+
 export function updateSidebarToggleState() {
   const btnChanged = $('#btn-changed');
   const hasGitChanges = !!(S.meta?.git && S.meta.gitChanges > 0);

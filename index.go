@@ -41,9 +41,10 @@ type Index struct {
 	children map[string][]Node
 	builtAt    time.Time
 	buildMS    int64
-	gitChanges int
-	gitFiles   []string
-	readyCh    chan struct{}
+	gitChanges   int
+	gitFiles     []string
+	gitStatusMap map[string]string
+	readyCh      chan struct{}
 }
 
 func NewIndex(root string) *Index {
@@ -88,6 +89,19 @@ func (ix *Index) GitChanges() (int, []string) {
 	res := make([]string, len(ix.gitFiles))
 	copy(res, ix.gitFiles)
 	return ix.gitChanges, res
+}
+
+func (ix *Index) GitStatusMap() map[string]string {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if ix.gitStatusMap == nil {
+		return map[string]string{}
+	}
+	res := make(map[string]string, len(ix.gitStatusMap))
+	for k, v := range ix.gitStatusMap {
+		res[k] = v
+	}
+	return res
 }
 
 // Children lists a directory for the tree. Ignored directories are never walked,
@@ -312,6 +326,7 @@ func (ix *Index) Build() {
 	}
 	ix.gitChanges = len(gitFiles)
 	ix.gitFiles = gitFiles
+	ix.gitStatusMap = gs
 	ix.files, ix.children = files, children
 	ix.builtAt, ix.buildMS = time.Now(), time.Since(start).Milliseconds()
 	select {
@@ -320,4 +335,74 @@ func (ix *Index) Build() {
 		close(ix.readyCh)
 	}
 	ix.mu.Unlock()
+}
+
+// UpdateGitStatus re-runs git status, updates in-memory status codes and dirty
+// directory markers across ix.children without re-walking the filesystem tree.
+// Reports gitChanges count, gitFiles list, whether any status changed, and the
+// raw status and dirty directory maps.
+func (ix *Index) UpdateGitStatus() (count int, files []string, changed bool, statuses map[string]string, dirtyDirs map[string]bool) {
+	if !ix.Ready() || gitDisabled || !gitAvailable(ix.root) {
+		return 0, nil, false, nil, nil
+	}
+
+	gs := gitStatus(ix.root)
+	if gs == nil {
+		gs = map[string]string{}
+	}
+
+	newDirtyDirs := map[string]bool{}
+	var newGitFiles []string
+	for p := range gs {
+		newGitFiles = append(newGitFiles, p)
+		for i := strings.LastIndexByte(p, '/'); i >= 0; i = strings.LastIndexByte(p, '/') {
+			p = p[:i]
+			newDirtyDirs[p] = true
+		}
+	}
+	sort.Slice(newGitFiles, func(i, j int) bool {
+		si, sj := gs[newGitFiles[i]], gs[newGitFiles[j]]
+		if (si != "U") != (sj != "U") {
+			return si != "U"
+		}
+		return newGitFiles[i] < newGitFiles[j]
+	})
+
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+
+	// Check if status map is unchanged
+	same := len(gs) == len(ix.gitStatusMap)
+	if same {
+		for k, v := range gs {
+			if ix.gitStatusMap[k] != v {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		resFiles := make([]string, len(ix.gitFiles))
+		copy(resFiles, ix.gitFiles)
+		return ix.gitChanges, resFiles, false, gs, newDirtyDirs
+	}
+
+	// Update nodes in-place across ix.children
+	for _, kids := range ix.children {
+		for i := range kids {
+			if kids[i].Dir {
+				kids[i].Dirty = newDirtyDirs[kids[i].Path]
+			} else {
+				kids[i].Status = gs[kids[i].Path]
+			}
+		}
+	}
+
+	ix.gitChanges = len(newGitFiles)
+	ix.gitFiles = newGitFiles
+	ix.gitStatusMap = gs
+
+	resFiles := make([]string, len(ix.gitFiles))
+	copy(resFiles, ix.gitFiles)
+	return ix.gitChanges, resFiles, true, gs, newDirtyDirs
 }

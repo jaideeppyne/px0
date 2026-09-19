@@ -72,6 +72,7 @@ export async function setDiffMode(mode) {
   } else {
     d.diffMode = mode;
     d.diffDismissed = false;
+    d.openedInDiffView = true;
     setLayoutPref(mode);
   }
   syncPreview(); // markdown preview and diff view are mutually exclusive

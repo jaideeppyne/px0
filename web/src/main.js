@@ -22,6 +22,7 @@ import { initMetrics, initStatusFit, updateMetricsDisplay, updateStatus } from '
 import { initSettings } from './settings.js';
 import { initVim } from './vim.js';
 import { initImageViewer } from './imageview.js';
+import { initGitStream } from './gitstream.js';
 
 // Initialize all subsystems
 initRenderer();
@@ -87,6 +88,7 @@ initImageViewer();
     restoreOpenDirs(savedDirs);
   } catch {}
   await refreshTree();
+  initGitStream();
 
   const hasGitChanges = !!(S.meta?.git && S.meta.gitChanges > 0);
   if (hasGitChanges) {
