@@ -306,7 +306,7 @@ func sortNodes(kids []Node) {
 func (ix *Index) Build() {
 	start := time.Now()
 	root := newIgnoreSet(nil)
-	root = root.child(readGitignore(ix.root, ""))
+	root = root.Child(readGitignore(ix.root, ""))
 
 	// Git status is computed up front, before the walk, rather than
 	// concurrently with it. It used to run in a goroutine so its ~80ms
@@ -369,7 +369,7 @@ func (ix *Index) Build() {
 		}
 		if rel != "" {
 			if extra := readGitignore(abs, rel); len(extra) > 0 {
-				ig = ig.child(extra)
+				ig = ig.Child(extra)
 			}
 		}
 		kids := make([]Node, 0, len(ents))
@@ -387,7 +387,7 @@ func (ix *Index) Build() {
 			if e.Type()&os.ModeSymlink != 0 {
 				continue
 			}
-			if ig.match(childRel, isDir) {
+			if ig.Match(childRel, isDir) {
 				// Listed so the tree can show it dimmed, but never walked or
 				// indexed, so search and quick open stay out of it.
 				if !(isDir && vcsDirs[name]) {
@@ -555,17 +555,15 @@ func injectDeletedNodes(children map[string][]Node, gs map[string]string, staged
 	}
 
 	for p, st := range gs {
-		if st == "D" {
-			yst := ""
-			if ys != nil {
-				yst = ys[p]
-			}
-			apply(p, st, staged != nil && staged[p], yst)
+		yst := ""
+		if ys != nil {
+			yst = ys[p]
 		}
+		apply(p, st, staged != nil && staged[p], yst)
 	}
 	if ys != nil {
 		for p, st := range ys {
-			if st == "D" && (gs == nil || gs[p] != "D") {
+			if gs == nil || gs[p] == "" {
 				apply(p, "", staged != nil && staged[p], st)
 			}
 		}
