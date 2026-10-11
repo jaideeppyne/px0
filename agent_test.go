@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/px0-ai/harness"
 )
 
 // writeHarness creates an executable stand-in for a coding harness, outside the
@@ -72,6 +75,11 @@ func agentServer(t *testing.T, root, harness string) *Server {
 	ix.Build()
 	s := NewServer(ix, nil)
 	s.SetAgent(m)
+	t.Cleanup(func() {
+		if s.gitWatcher != nil {
+			s.gitWatcher.Stop()
+		}
+	})
 	return s
 }
 
@@ -137,18 +145,33 @@ func TestAgentDetectListsKnownHarnesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := m.Detect()
-	if len(got) != len(agentPresets) {
-		t.Fatalf("detected %d rows, want one per preset (%d)", len(got), len(agentPresets))
+	presets := harness.Presets()
+	if len(got) != len(presets) {
+		t.Fatalf("detected %d rows, want one per preset (%d)", len(got), len(presets))
 	}
 	for i, h := range got {
-		if h.Name != agentPresets[i].Name {
-			t.Fatalf("row %d = %q, want %q", i, h.Name, agentPresets[i].Name)
+		if h.Name != presets[i].Name {
+			t.Fatalf("row %d = %q, want %q", i, h.Name, presets[i].Name)
 		}
 		if !strings.Contains(h.Cmd, "{prompt}") {
 			t.Fatalf("%s cmd should show the template, got %q", h.Name, h.Cmd)
 		}
 		if h.Installed && h.Path == "" {
 			t.Fatalf("%s reported installed with no path", h.Name)
+		}
+	}
+}
+
+func TestAgentDetectLazyModels(t *testing.T) {
+	isolateSettings(t)
+	m, err := newAgentManager(t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := m.Detect()
+	for _, h := range got {
+		if len(h.Models) > 0 {
+			t.Fatalf("harness %q had models eagerly discovered when unselected", h.Name)
 		}
 	}
 }
@@ -374,21 +397,24 @@ func TestAgentModelSelectionAndDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := m.Detect()
+	if len(rows) == 0 {
+		t.Fatal("expected detected rows")
+	}
 	for _, h := range rows {
-		if len(h.Models) == 0 {
-			t.Fatalf("%s should list models", h.Name)
+		if !h.Installed {
+			continue
 		}
-		if h.Model == "" {
-			t.Fatalf("%s should have a default model", h.Name)
+		if err := m.Select(h.Name, "custom-model"); err != nil {
+			t.Fatalf("select %s with model: %v", h.Name, err)
 		}
-		if h.Model != h.Models[0] {
-			t.Fatalf("%s default model %q != least capable model %q", h.Name, h.Model, h.Models[0])
+		if m.Model() != "custom-model" {
+			t.Fatalf("model = %q, want custom-model", m.Model())
 		}
 	}
 }
 
 func TestPresetArgvOrder(t *testing.T) {
-	for _, p := range agentPresets {
+	for _, p := range harness.Presets() {
 		n := len(p.Args)
 		if n < 2 {
 			t.Fatalf("preset %s args too short: %v", p.Name, p.Args)
@@ -397,7 +423,7 @@ func TestPresetArgvOrder(t *testing.T) {
 			t.Fatalf("preset %s args %v: want {prompt} at the very end", p.Name, p.Args)
 		}
 
-		// When resolved with default model, {prompt} must remain at the very end
+		// When resolved, {prompt} must remain at the very end
 		_, resolved, _, err := resolveAgentSpec(p.Name, "")
 		if err != nil {
 			continue // tool may not be installed in test env
@@ -416,25 +442,16 @@ func TestClaudeModelDiscovery(t *testing.T) {
 	if err := os.WriteFile(fakeClaude, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 
-	discoveredModelsMu.Lock()
-	delete(discoveredModels, "claude")
-	delete(discoveringModels, "claude")
-	discoveredModelsMu.Unlock()
-
-	runModelDiscovery("claude", fakeClaude, []string{"haiku", "sonnet", "opus"})
-
-	discoveredModelsMu.Lock()
-	models := discoveredModels["claude"]
-	discoveredModelsMu.Unlock()
+	models, err := harness.DiscoverModels(context.Background(), "claude")
+	if err != nil {
+		t.Fatalf("DiscoverModels error: %v", err)
+	}
 
 	if len(models) == 0 {
 		t.Fatal("expected discovered models for claude, got none")
 	}
-	if models[0] != "haiku" {
-		t.Fatalf("expected least capable default 'haiku' at index 0, got %q", models[0])
-	}
-	// Check that fable, best, sonnet[1m] etc are parsed
 	foundFable := false
 	for _, m := range models {
 		if m == "fable" {
@@ -475,7 +492,7 @@ func TestAgentAllowsNonOverlappingEditsInParallel(t *testing.T) {
 		t.Skip("git not installed")
 	}
 	root := gitRepo(t)
-	s := agentServer(t, root, writeHarness(t, "sleep 1\n"))
+	s := agentServer(t, root, writeHarness(t, "sleep 0.15\n"))
 
 	code, first := agentPost(t, s, "/api/agent/edit?path=keep.go&l1=1&l2=1&instruction=one")
 	if code != 200 {
@@ -603,6 +620,18 @@ func TestChangedSinceReportsBothDirections(t *testing.T) {
 	}
 }
 
+// The job summary and API response list changed files, so their order must not
+// follow Go's randomised map iteration. Repeated to catch a lucky ordering.
+func TestChangedSinceIsSorted(t *testing.T) {
+	before := map[string]string{"b.go": "M", "d.go": "M"}
+	after := map[string]string{"c.go": "U", "a.go": "M", "d.go": "M"}
+	for i := 0; i < 20; i++ {
+		if got := strings.Join(changedSinceMaps(before, after), ","); got != "a.go,b.go,c.go" {
+			t.Fatalf("changed = %q, want a.go,b.go,c.go", got)
+		}
+	}
+}
+
 func TestLineRefAndPrompt(t *testing.T) {
 	if lineRef(4, 4) != "4" {
 		t.Fatalf("single line ref = %q", lineRef(4, 4))
@@ -651,23 +680,23 @@ func TestShellQuoteAndCommand(t *testing.T) {
 func TestAllPresetArgvFormatting(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
-	for _, p := range agentPresets {
+	for _, p := range harness.Presets() {
 		binPath := filepath.Join(dir, p.Args[0])
 		if err := os.WriteFile(binPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	for _, p := range agentPresets {
-		name, resolved, model, err := resolveAgentSpec(p.Name, "")
+	for _, p := range harness.Presets() {
+		name, resolved, model, err := resolveAgentSpec(p.Name, "test-model")
 		if err != nil {
 			t.Fatalf("resolveAgentSpec(%q) error: %v", p.Name, err)
 		}
 		if name != p.Name {
 			t.Errorf("name = %q, want %q", name, p.Name)
 		}
-		if model != p.DefaultModel {
-			t.Errorf("model = %q, want %q", model, p.DefaultModel)
+		if model != "test-model" {
+			t.Errorf("model = %q, want %q", model, "test-model")
 		}
 		if resolved[len(resolved)-1] != "{prompt}" {
 			t.Errorf("%s final arg = %q, want {prompt}", p.Name, resolved[len(resolved)-1])
@@ -675,13 +704,13 @@ func TestAllPresetArgvFormatting(t *testing.T) {
 		// Ensure model flag was inserted properly
 		hasModel := false
 		for i, a := range resolved {
-			if a == p.ModelFlag && i+1 < len(resolved) && resolved[i+1] == p.DefaultModel {
+			if a == p.ModelFlag && i+1 < len(resolved) && resolved[i+1] == "test-model" {
 				hasModel = true
 				break
 			}
 		}
 		if !hasModel {
-			t.Errorf("%s resolved args %v missing model flag %q %q", p.Name, resolved, p.ModelFlag, p.DefaultModel)
+			t.Errorf("%s resolved args %v missing model flag %q %q", p.Name, resolved, p.ModelFlag, "test-model")
 		}
 	}
 }
@@ -893,5 +922,49 @@ func TestAgentBatchEditPayloadVariations(t *testing.T) {
 		t.Fatalf("empty batch error = %v", b4["error"])
 	}
 }
+
+func TestCommitMessagePrompt(t *testing.T) {
+	files := []string{"web/src/gitpanel.js", "server.go"}
+	stat := " web/src/gitpanel.js | 15 +++\n server.go           | 40 ++-\n 2 files changed, 45 insertions(+), 10 deletions(-)"
+	diff := "diff --git a/server.go b/server.go\n--- a/server.go\n+++ b/server.go\n@@ -1 +1 @@\n-old\n+new"
+	instruction := "Follow conventional commits format"
+
+	p := commitMessagePrompt(files, stat, diff, instruction)
+	if !strings.Contains(p, "Changed files (2):") {
+		t.Errorf("prompt missing changed files header:\n%s", p)
+	}
+	if !strings.Contains(p, "- web/src/gitpanel.js") || !strings.Contains(p, "- server.go") {
+		t.Errorf("prompt missing changed file paths:\n%s", p)
+	}
+	if !strings.Contains(p, "Summary of changes (diffstat):") || !strings.Contains(p, stat) {
+		t.Errorf("prompt missing diffstat summary:\n%s", p)
+	}
+	if !strings.Contains(p, "Staged diff:") || !strings.Contains(p, diff) {
+		t.Errorf("prompt missing staged diff:\n%s", p)
+	}
+	if !strings.Contains(p, "Additional instructions from the user: "+instruction) {
+		t.Errorf("prompt missing user instruction:\n%s", p)
+	}
+
+	// Test truncation when there are > 100 files
+	manyFiles := make([]string, 125)
+	for i := range manyFiles {
+		manyFiles[i] = fmt.Sprintf("file%d.go", i)
+	}
+	p2 := commitMessagePrompt(manyFiles, "", "", "")
+	if !strings.Contains(p2, "Changed files (125):") {
+		t.Errorf("prompt missing total count:\n%s", p2)
+	}
+	if !strings.Contains(p2, "... and 25 more files") {
+		t.Errorf("prompt missing truncation notice:\n%s", p2)
+	}
+	if !strings.Contains(p2, "- file0.go") || !strings.Contains(p2, "- file99.go") {
+		t.Errorf("prompt missing head files:\n%s", p2)
+	}
+	if strings.Contains(p2, "- file100.go") {
+		t.Errorf("prompt contains file beyond 100:\n%s", p2)
+	}
+}
+
 
 

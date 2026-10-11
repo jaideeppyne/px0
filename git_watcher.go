@@ -6,20 +6,36 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
+// GitStatusPayload contains the complete serialized git status event sent to the browser
+// over Server-Sent Events (SSE). It includes working tree status, staged files, dirty directories,
+// current branch, commit ahead/behind counts, and recent commits.
 type GitStatusPayload struct {
-	Git        bool              `json:"git"`
-	GitChanges int               `json:"gitChanges"`
-	GitFiles   []string          `json:"gitFiles"`
-	Statuses   map[string]string `json:"statuses"`
-	DirtyDirs  map[string]bool   `json:"dirtyDirs,omitempty"`
+	Git           bool              `json:"git"`                     // True if root is inside a git repository
+	GitChanges    int               `json:"gitChanges"`              // Total count of modified, added, deleted, or untracked files
+	GitFiles      []string          `json:"gitFiles"`                // List of modified file paths relative to root
+	Statuses      map[string]string `json:"statuses"`                // Relative path -> status code (e.g. "M", "A", "D", "U")
+	DirtyDirs     map[string]bool   `json:"dirtyDirs,omitempty"`     // Relative directory path -> true if any descendant is modified
+	Staged        map[string]bool   `json:"staged,omitempty"`        // Relative path -> true if file has staged changes
+	YourStatuses  map[string]string `json:"yourStatuses,omitempty"`  // PR mode: relative path -> reviewer modification status
+	YourDirtyDirs map[string]bool   `json:"yourDirtyDirs,omitempty"` // PR mode: directory path -> contains reviewer changes
+	Branch        string            `json:"branch,omitempty"`        // Active branch name
+	RecentCommits []GitCommit       `json:"recentCommits,omitempty"` // Recent git commits for commit list UI
+	CommitsURL    string            `json:"commitsUrl,omitempty"`    // Web URL to view commits on GitHub/forge
+	Ahead         int               `json:"ahead"`                   // Commits ahead of upstream tracking branch
+	Behind        int               `json:"behind"`                  // Commits behind upstream tracking branch
 }
 
+// GitWatcher monitors git state changes in the background and broadcasts updates
+// to connected browser clients over SSE (/api/stream). It uses a hybrid detection strategy:
+//  1. Fast path: 1-second polling of .git metadata files (HEAD, index, packed-refs) to instantly
+//     detect CLI operations (git commit, git checkout, git add).
+//  2. Worktree path: adaptive polling of working tree file modifications.
+//  3. Manual triggers: immediate re-evaluations triggered on user UI actions.
 type GitWatcher struct {
 	ix   *Index
 	root string
@@ -31,19 +47,24 @@ type GitWatcher struct {
 	triggerCh chan struct{}
 	stopCh    chan struct{}
 
-	lastIndexMod  time.Time
-	lastIndexSize int64
-	lastHeadMod   time.Time
-	lastPackedMod time.Time
+	lastIndexMod   time.Time
+	lastIndexSize  int64
+	lastHeadMod    time.Time
+	lastPackedMod  time.Time
+	lastHeadCommit string
+	lastAhead      int
+	lastBehind     int
 }
 
+// NewGitWatcher constructs a new GitWatcher attached to the given workspace index.
 func NewGitWatcher(ix *Index) *GitWatcher {
 	gw := &GitWatcher{
-		ix:        ix,
-		root:      ix.Root(),
-		clients:   make(map[chan []byte]struct{}),
-		triggerCh: make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
+		ix:             ix,
+		root:           ix.Root(),
+		clients:        make(map[chan []byte]struct{}),
+		triggerCh:      make(chan struct{}, 1),
+		stopCh:         make(chan struct{}),
+		lastHeadCommit: gitHeadCommit(ix.Root()),
 	}
 	return gw
 }
@@ -114,7 +135,7 @@ func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
 	metaTicker := time.NewTicker(1 * time.Second)
 	defer metaTicker.Stop()
 
-	adaptiveInterval := 2 * time.Second
+	adaptiveInterval := 1 * time.Second
 	worktreeTicker := time.NewTicker(adaptiveInterval)
 	defer worktreeTicker.Stop()
 
@@ -140,12 +161,12 @@ func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
 			// Only run when at least one client is actively listening.
 			if gw.active.Load() > 0 {
 				dur := gw.checkAndBroadcast()
-				// Adapt interval based on execution speed: min 2s, max 15s.
-				newInterval := dur * 10
-				if newInterval < 2*time.Second {
-					newInterval = 2 * time.Second
-				} else if newInterval > 15*time.Second {
-					newInterval = 15 * time.Second
+				// Adapt interval based on execution speed: min 1s, max 10s.
+				newInterval := dur * 5
+				if newInterval < 1*time.Second {
+					newInterval = 1 * time.Second
+				} else if newInterval > 10*time.Second {
+					newInterval = 10 * time.Second
 				}
 				if newInterval != adaptiveInterval {
 					adaptiveInterval = newInterval
@@ -172,13 +193,41 @@ func (gw *GitWatcher) loop(ctx context.Context, gitdir string) {
 // Refresh runs an immediate UpdateGitStatus, broadcasts to subscribers if changed,
 // and returns the latest git status payload.
 func (gw *GitWatcher) Refresh() GitStatusPayload {
-	count, files, changed, statuses, dirtyDirs := gw.ix.UpdateGitStatus()
+	count, files, changed, statuses, dirtyDirs, staged, yourStatuses, yourDirtyDirs := gw.ix.UpdateGitStatus()
+	var recentCommits []GitCommit
+	var ahead, behind int
+	if gitAvailable(gw.root) {
+		recentCommits = gitRecentCommits(gw.root, 5)
+		headCommit := ""
+		if len(recentCommits) > 0 {
+			headCommit = recentCommits[0].Hash
+		}
+		ahead, behind = gw.aheadBehind()
+		gw.mu.Lock()
+		if headCommit != gw.lastHeadCommit || ahead != gw.lastAhead || behind != gw.lastBehind {
+			gw.lastHeadCommit = headCommit
+			gw.lastAhead = ahead
+			gw.lastBehind = behind
+			changed = true
+		}
+		gw.mu.Unlock()
+	}
+
+	branch := gitCurrentBranch(gw.root)
 	payload := GitStatusPayload{
-		Git:        gitAvailable(gw.root),
-		GitChanges: count,
-		GitFiles:   files,
-		Statuses:   statuses,
-		DirtyDirs:  dirtyDirs,
+		Git:           gitAvailable(gw.root),
+		GitChanges:    count,
+		GitFiles:      files,
+		Statuses:      statuses,
+		DirtyDirs:     dirtyDirs,
+		Staged:        staged,
+		YourStatuses:  yourStatuses,
+		YourDirtyDirs: yourDirtyDirs,
+		Branch:        branch,
+		RecentCommits: recentCommits,
+		CommitsURL:    gitCommitsWebURL(gw.root, branch),
+		Ahead:         ahead,
+		Behind:        behind,
 	}
 	if changed {
 		data, err := json.Marshal(payload)
@@ -188,6 +237,18 @@ func (gw *GitWatcher) Refresh() GitStatusPayload {
 		}
 	}
 	return payload
+}
+
+// aheadBehind counts local commits not yet on the remote. In a PR review the
+// checkout is a detached HEAD with no upstream, so "ahead" is measured from the
+// PR head it was checked out at (or last pushed to) -- exactly the reviewer's
+// own commits. Behind stays 0 there: knowing it needs a fetch, which Pull does.
+func (gw *GitWatcher) aheadBehind() (ahead, behind int) {
+	if head := gw.ix.PushedHead(); head != "" {
+		return gitCountSince(gw.root, head), 0
+	}
+	ahead, behind, _ = gitAheadBehind(gw.root)
+	return ahead, behind
 }
 
 // checkAndBroadcast runs UpdateGitStatus and broadcasts to subscribers if changed.
@@ -222,22 +283,7 @@ func (gw *GitWatcher) Subscribe() (<-chan []byte, func()) {
 	inGit := gitAvailable(gw.root)
 	var initialMsg []byte
 	if inGit {
-		count, files := gw.ix.GitChanges()
-		statuses := gw.ix.GitStatusMap()
-		dirtyDirs := map[string]bool{}
-		for p := range statuses {
-			for i := strings.LastIndexByte(p, '/'); i >= 0; i = strings.LastIndexByte(p, '/') {
-				p = p[:i]
-				dirtyDirs[p] = true
-			}
-		}
-		payload := GitStatusPayload{
-			Git:        true,
-			GitChanges: count,
-			GitFiles:   files,
-			Statuses:   statuses,
-			DirtyDirs:  dirtyDirs,
-		}
+		payload := gw.Refresh()
 		if data, err := json.Marshal(payload); err == nil {
 			initialMsg = []byte(fmt.Sprintf("event: git-status\ndata: %s\n\n", data))
 		}
