@@ -1,6 +1,6 @@
-# Git Awareness & Diffing
+# Git Awareness, Diffing & Stage/Commit/Push/Pull
 
-This document describes the design and implementation of px0's git integration engine ([`git.go`](../../git.go)) and its diff-rendering frontend ([`web/src/diff.js`](../../web/src/diff.js)).
+This document describes the design and implementation of px0's git integration engine ([`git.go`](../../git.go)), its diff-rendering frontend ([`web/src/diff.js`](../../web/src/diff.js)), and the sidebar git panel that stages, commits, pushes, and pulls ([`web/src/gitpanel.js`](../../web/src/gitpanel.js), [`web/src/tree.js`](../../web/src/tree.js)).
 
 ## 1. Zero-Dependency Shell-Out Architecture
 
@@ -8,9 +8,10 @@ px0 avoids heavy third-party Go git libraries (such as `go-git`, which can consu
 
 Instead, px0 adheres to a Pure Shell-Out Architecture:
 
-- Shells out directly to the host `git` binary.
-- Never stages, commits, or changes refs or the index. The only workspace writes px0 makes are the ones a dispatched coding harness makes itself ([Harness Editing & Agent Dispatch](agent-editing.md)).
-- Zero disk footprint: holds all status and diff structures in volatile memory on the `Index` (`Node.Status`).
+- Shells out directly to the host `git` binary, for reads (`status`, `diff`, `merge-base`) and, since the git panel, for writes (`add`, `reset`, `commit`, `push`, `fetch`, `merge --ff-only`, `reset --hard`).
+- Status and diffing themselves never stage, commit, or change refs or the index — that half of the engine is still purely read-only. The git panel's write endpoints (`/api/git/stage`, `unstage`, `commit`, `push`, `pull`) are the only exception, and every one of them fires exactly once per explicit click; nothing runs on a timer or in response to a file change. See §9.
+- A dispatched coding harness ([Harness Editing & Agent Dispatch](agent-editing.md)) can still write anything else in the workspace — including, via **Commit with AI**, the *text* of a commit message — but never touches git state itself; only px0's own git-panel endpoints do that.
+- Zero disk footprint: holds all status and diff structures in volatile memory on the `Index` (`Node.Status`, `Node.Staged`).
 - Graceful degradation: if `git` is not installed, or if the opened directory is not a git repository, git features degrade silently without warnings or errors.
 - Can be disabled explicitly using the `-no-git` CLI flag.
 
@@ -51,6 +52,8 @@ Git status codes are mapped onto tree nodes:
 - `D`: Deleted
 - `U`: Untracked
 - `R`: Renamed
+
+Separately, `Node.Staged` (a plain bool, not folded into the status letter) tracks whether a file has staged index changes — see §9 for how the git panel populates and reacts to it.
 
 ### Ancestor Folder Dirty Propagation (`Node.Dirty`)
 
@@ -145,9 +148,9 @@ To keep git statuses, sidebar badges, and editor gutter diff indicators in sync 
    - `Index.UpdateGitStatus()` executes `gitStatus(ix.root)` concurrently, compares the new status map against `ix.gitStatusMap`, and if changed, updates `Node.Status` and `Node.Dirty` in-place on existing `ix.children` nodes.
    - If the status map is identical, no memory allocations or broadcasts occur.
 
-5. **Server-Sent Events (SSE) Stream (`/api/git/stream`)**
+5. **Server-Sent Events (SSE) Stream (`/api/stream` / `/api/git/stream`)**
    - Implemented using Go standard library `http.Flusher` without external dependencies.
-   - Dispatches structured events:
+   - Dispatches structured events (`git-status` and `metrics`):
      ```
      event: git-status
      data: {"git":true,"gitChanges":2,"gitFiles":["main.go","git.go"],"statuses":{"main.go":"M","git.go":"M"},"dirtyDirs":{"web":true}}
@@ -247,6 +250,7 @@ When developers use px0 to inspect AI agent changes or review git branches, they
    ```javascript
    for (let i = S.tabs.length - 1; i >= 0; i--) {
      const t = S.tabs[i];
+     if (t.diffRef) continue; // pinned to a commit; see §10
      const code = statuses[t.path];
      const isDiff = !!code && code !== 'U';
      const wasDiff = !!(t.diffMode || t.openedInDiffView);
@@ -259,3 +263,124 @@ When developers use px0 to inspect AI agent changes or review git branches, they
 3. **Active Pointer Stability**: In `closeTab(i)`, closing tabs to the left of the currently active tab decrements `S.active` (`S.active--`) rather than jumping the user to an unintended tab.
 4. **Empty State & Explorer Fallback**: If all git changes are discarded while the sidebar is in changed-only mode (`#tree.changed-only`), px0 automatically toggles back to standard file explorer mode so the user is never left viewing an empty tree.
 
+## 8. Diffing Against an Arbitrary Base
+
+`gitDiff`/`gitHunks` above are thin `base="HEAD"` wrappers around `gitDiffAgainst`/`gitHunksAgainst`, which take an arbitrary base ref rather than assuming the working tree's `HEAD`. The one other caller is PR review (`px0 <url>`), which diffs a checked-out PR against its merge-base with the target branch instead. See [GitHub PR Review](github-pr-review.md).
+
+## 9. Stage, Commit, Push, Pull
+
+The sidebar git panel (`web/src/gitpanel.js`) and the file tree's per-row stage tick (`web/src/tree.js`) are the write half of git integration. Every action is a single explicit HTTP call from a button or tick click; nothing here is triggered by the status watcher, a timer, or a file change.
+
+### Staged-Path Tracking
+
+`gitStagedPaths(root)` (`git.go`) runs `git diff --name-only --cached -z` and maps each path through the same `repoRelKey` helper `gitStatusAgainst` uses, so staged state is keyed identically to status. `Index.gitStagedMap` and `Node.Staged` carry it alongside the existing `gitStatusMap`/`Node.Status`, populated in both `Index.Build()` and `Index.UpdateGitStatus()`. `UpdateGitStatus`'s "did anything change" check compares *both* maps — staging a file often leaves its collapsed status letter unchanged (a modified-and-unstaged `M` and a modified-and-staged `M` are the same letter), so comparing status alone would silently swallow a stage/unstage broadcast. `GitStatusPayload` (`git_watcher.go`) carries the resulting `Staged` map and the current `Branch` name (`gitCurrentBranch`) down the same SSE stream (`/api/stream`) that already pushes status.
+
+### Stage / Unstage / Commit
+
+`gitStage`/`gitUnstage`/`gitCommit` (`git.go`) are thin wrappers around `git add -- <path>`, `git reset -- <path>`, and `git commit -m <message>`. An empty path to `gitStage` means "the served root itself", so **Stage All** reuses the same `/api/git/stage` endpoint with `path: "."` instead of a dedicated route. `gitCommit` checks `gitStagedPaths` before shelling out, so an empty index fails fast with "nothing staged to commit" rather than surfacing git's own message. All three endpoints (`handleGitStage`, `handleGitUnstage`, `handleGitCommit` in `server.go`) validate `path` through `s.safePath` — the same traversal guard `handleFile`/`handleRaw` use — and call `s.gitWatcher.Trigger()` on success so the SSE stream broadcasts immediately instead of waiting for the next poll tick.
+
+### Fast-Forward-Only Pull
+
+`gitFFOnlyPull(root, remote, ref)` fetches `ref` from `remote` and runs `git merge --ff-only FETCH_HEAD`. If that merge fails for any reason, it returns the sentinel `errNotFastForward` without having touched history — px0 never falls back to a real merge, so there is never a conflicted state to clean up. `handleGitPull` (`server.go`) checks `gitHasUncommittedChanges` first and refuses outright (409) if the working tree is dirty, then resolves the branch's upstream (`gitUpstream`, wrapping `git rev-parse --abbrev-ref <branch>@{u}`) and calls `gitFFOnlyPull`. A `409` with `errNotFastForward` becomes a plain-language refusal ("can't fast-forward ... resolve manually, not supported here") rather than raw git output.
+
+In a PR review session, Pull instead re-syncs with the pull request's current head — see [GitHub PR Review §7](github-pr-review.md).
+
+### Push
+
+For a plain workspace, `handleGitPush` runs a bare `gitPush` (`git push`); if that fails specifically because the branch has no upstream, it retries once with `gitPushSetUpstream(root, "origin", branch)`. Neither path ever forces. In a PR review session, `s.pr.Push()` takes over instead — see [GitHub PR Review §7](github-pr-review.md).
+
+### Commit with AI
+
+**Commit with AI** is a text-generation dispatch, not a file edit: `agentManager.StartPrompt(label, prompt)` (`agent.go`) is a sibling of `StartBatch` that skips every file-range concern — no snippet read, no overlap check, no target path — and reuses the same `run()` executor (spawn, stream stdout/stderr into `tailBuffer`s, `changedSince` diff). `handleGitCommitMessage` (`server.go`) builds the prompt from the staged file paths (`gitStagedFiles`), diffstat (`gitStagedStat`), capped staged diff (`gitStagedDiff`), and the `git.commitMessageInstruction` setting via `commitMessagePrompt` (`agent.go`), and refuses with 400 before ever dispatching a harness if nothing is staged. The frontend polls the returned job through the same `/api/agent/job` endpoint an inline edit uses, drops the (fence-stripped) `stdout` into the commit textarea, and immediately calls `/api/git/commit` with it — two endpoints, one user action.
+
+### HTTP Surface
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/git/stage` | POST | `{path}` — stage a file, or `"."` for everything. |
+| `/api/git/unstage` | POST | `{path}` — unstage a file. |
+| `/api/git/commit` | POST | `{message}` — commit whatever is staged. `400` if nothing is. |
+| `/api/git/push` | POST | Push the current branch, or (PR session) the PR's head branch. |
+| `/api/git/pull` | POST | Fast-forward pull, or (PR session) re-sync with the PR head. `409` on divergence or uncommitted changes. |
+| `/api/git/commit-message` | POST | Dispatch the selected harness to write a commit message for the staged diff. Returns an `agentJob`, polled via `/api/agent/job`. `400` if nothing is staged or no harness is selected. |
+
+Every write endpoint is guarded by `localPost` ([`lspsetup.go`](../../lspsetup.go)), the same POST-only, same-origin, IP-or-localhost check every other mutating px0 endpoint uses.
+
+## 10. Unpushed Commits (`@{u}..HEAD`)
+
+Everything above diffs against the working tree. The moment a change is committed it leaves that view entirely — the tree goes clean, the gutter empties, the diff tab closes — even though a local commit is exactly the thing most likely to still need reading. Section 10 is the read path for those commits, from `git commit` until `git push`.
+
+It is strictly read-only: no endpoint here writes to the index, a ref, or a remote. Every call fails quiet the way the rest of `git.go` does — no upstream, no git, or an unknown SHA all yield an empty result rather than an error, and the sidebar section simply doesn't appear.
+
+### Which Commits, and Against What
+
+`gitUpstreamRef(root)` runs `git rev-parse --abbrev-ref --symbolic-full-name @{u}` and returns the tracking branch as git names it (`origin/master`). `gitUnpushedCommits(root, limit)` then logs `@{u}..HEAD`, newest first.
+
+Unlike `gitAheadBehind`, there is **no `origin/<branch>` fallback and no "count every local commit" fallback**. Those exist so the Push button can still light up on an unpublished branch, where being approximately right is better than being dead. A list of commits is different: measuring it against a branch git does not consider upstream would show a confident, wrong answer. With no upstream configured, `/api/unpushed` reports `available: false` and the section is hidden.
+
+The upstream ref name travels with the list and is rendered beside the section title, because "unpushed" alone doesn't say *unpushed where* — a branch can be ahead of `origin/master` and behind a fork's.
+
+### Per-Commit Reads
+
+Three reads share one set of `git diff-tree` flags (`commitDiffArgs`): `--no-commit-id -r -m --first-parent --root`. That combination gives one entry per **path** rather than per tree, and `--root` means the repository's very first commit still has something to diff against, so it needs no empty-tree special case. `-m --first-parent` makes a merge commit diff against the branch it merged into, which is the only reading of a merge that matches what the sidebar claims to be listing.
+
+| Function | Shell-out | Returns |
+| --- | --- | --- |
+| `gitCommitFiles(root, sha)` | `git diff-tree --name-status -z …` + `gitCommitNumstat` (`git show --numstat -z -m --first-parent`) | Paths the commit touched, with git's status letter (`M`/`A`/`D`/`R`/`C`/`T`) and each path's `add`/`del` line counts (`binary` when numstat reports `-`), mapped through `repoRelKey` so a repo served from a subdirectory lists only what it can open. |
+| `gitCommitDetail(root, sha)` | `git show -s --format=…` + `git diff-tree --numstat …` | Author, email, relative and ISO dates, the full message, and the files/insertions/deletions diffstat. |
+| `gitDiffCommit(root, relpath, sha)` | `git diff-tree -p --no-color …` | The unified diff that commit alone made to one file. |
+
+`gitHunksCommit` feeds `gitDiffCommit`'s output to `parseDiffHunks` — the same state machine `gitHunksAgainst` uses, split out of it so a commit's gutter and the working tree's are parsed by one piece of code.
+
+Every SHA that reaches `exec.Command` as a bare revision passes `validSHA` (`^[0-9a-fA-F]{4,40}$`) first. The only way a SHA reaches these endpoints is from a list px0 itself produced, so anything else is a bug or a probe; refusing it keeps a crafted `--upload-pack=…` out of an argument list.
+
+### The `ref` Parameter on `/api/diff` and `/api/gutter`
+
+Rather than add two more endpoints, the existing diff and gutter endpoints take an optional `ref`:
+
+- **`ref` empty** — unchanged: the working tree against `s.diffBase` (`HEAD`, or a PR merge-base in review mode).
+- **`ref=<sha>`** — that commit's own diff, via `gitDiffCommit`/`gitHunksCommit`. The working tree is not consulted at all, so the result is frozen no matter what is edited afterwards.
+
+`/api/file` takes the same parameter, for one reason: a file the commit **deleted** has nothing on disk, so the existing "does the working tree have a diff for it" check can't vouch for it and the open would 404. With a `ref`, `handleFile` asks whether that commit touched the path instead, and returns the same zero-line `deleted: true` document a working-tree deletion produces.
+
+### HTTP Surface
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/unpushed` | GET | `{available, upstream, commits[]}` — commits in `@{u}..HEAD`, newest first. `available: false` with no upstream or nothing ahead. |
+| `/api/commitfiles?sha=` | GET | `{sha, files[]}` — the paths one commit touched, with status letters and line counts. Empty list for an unknown SHA. |
+| `/api/commitdetail?sha=` | GET | Author, message and diffstat for the hover card. `404` for an unknown SHA. |
+| `/api/diff?path=&ref=` | GET | With `ref`, that commit's diff for the file instead of the working tree's. |
+| `/api/gutter?path=&ref=` | GET | Same, for the change gutter. |
+| `/api/file?path=&ref=` | GET | `ref` only matters for a file the commit deleted; it opens as a zero-line deleted document so its diff can be read. |
+
+All six are GET reads with no `localPost` guard, because none of them changes anything.
+
+### Frontend (`web/src/unpushed.js`)
+
+The section lives under the file tree in the sidebar, behind the same **changed files only** toggle as the dirty-file filter — it is a review view, not a home-screen fixture. That toggle's availability is now `hasGitView()` in `tree.js`, which is true when there are working-tree changes **or** unpushed commits: committing everything empties the tree, and without counting commits the toggle would disable itself exactly when the section it reveals became the only thing worth looking at. On a clean tree the tree stops claiming the sidebar's spare height (`#tree.changed-only.no-changes`) and says "Working tree clean", leaving the section the whole of the view.
+
+Clicking a commit expands it into its file list, badged with the same `git-M`/`git-A`/`git-D` classes the tree uses. Clicking a file opens it with `openFile(path, { ref, view: 'diff' })`. A tab carries that commit on `d.diffRef`, shows `@<short-sha>` in the tab strip, and renders its diff in a labelled `In commit <sha>` section. Opening the same path from anywhere else — tree, search, go-to-definition — passes no ref and puts the tab back on the working tree, which is what "open this file" means everywhere else in px0.
+
+A commit-pinned tab is deliberately invisible to the working-tree reconciliation in `gitstream.js`: it is skipped by the auto-close pass, by the `diffAvailable` sync, and by the reload trigger. The working tree going clean is precisely when you still want to be reading one. The ref is persisted in the workspace session (`SessionTab.Ref`), so a reload comes back pinned.
+
+The list is refreshed from the `ahead` count and head SHA that already ride on every git-status SSE tick, so it re-reads `git log` only when one of them actually moved, and explicitly after a commit, push, pull or reindex. A commit that disappears (amend, rebase, push) drops its cached file list and detail with it. A commit's file rows are built `COMMIT_FILES_PAGE` (100) at a time behind a **Show 100 more** row (`web/src/commitfiles.js`), and only while that commit is open. A squash or a vendor bump can touch thousands of paths: building them all at once for a 20,000-file commit cost 224k DOM nodes and a 550 MB tab, where one page costs about 1,000 nodes.
+
+### Recent Commits (`web/src/gitpanel.js`)
+
+The git panel's Recent Commits list uses the same reads and the same pinned tabs. `/api/git/log` now also returns each commit's full SHA (`full`), so a file opened from either list pins its tab to the same `diffRef`. Clicking a commit expands it into its files from `/api/commitfiles`, drawn with the same `commitfiles.js` rows and paging; collapsing deletes the rows rather than hiding them. The git-status stream re-sends the recent commits on every tick, so the list is rebuilt only when the commits themselves change, and open commits are re-expanded from cache. The short-hash chip copies the SHA; arrow keys, Enter and Space move through commits and files.
+
+### Stepping Through a Commit (`web/src/diff.js`)
+
+A pinned tab's diff view opens with a strip showing the file's status, path, line counts and place in the commit (`3 / 17`), with ‹ › to step to the neighbouring file. The file list comes from `/api/commitfiles` once per SHA through `loadCommitFiles` (`commitfiles.js`), cached and shared with the sidebar rows, since a commit's files never change. `stepCommitFile` (`tabs.js`) opens the next file pinned to the same commit and closes the tab stepped away from, so stepping swaps a tab in place rather than leaving one open per file. Binary files are passed over (`commitStepTarget`): they have no text diff, and `/api/file` refuses to open them.
+
+### Hover Cards That Stay Open (`web/src/cardkeep.js`)
+
+Hovering a commit opens a card with its author, full message and diffstat (insertions green, deletions red), a **Copy SHA** button, and a best-effort GitHub link on the author name: a `users.noreply.github.com` address carries the login outright and becomes a profile link, any other address can only support "this repository's commits by this address", and a non-GitHub remote gets no link at all.
+
+Both this card and the existing LSP hover card used to close before you could reach them. Two separate causes, both fixed in `cardkeep.js`, which now owns the lifetime of each:
+
+1. A card armed its hide from a `mouseleave` on whatever sat underneath it and gave the pointer a fixed window to arrive. Cross the gap slower than that — or pause on the way — and the card was gone before the pointer reached it, with nothing left listening to cancel the timer, because the pointer had already left every element that was.
+2. "Is the pointer still near the card" was measured from an anchor captured when the card was *requested*, not when it opened. A hover response can take seconds, so the card could appear anchored to where the pointer used to be, and the very next move read as "left the card".
+
+`makeCardKeeper(el, { hide })` replaces both with one document-level pointer track — so the pointer is never unobserved, wherever it goes — one timer per card, and every decision made against where the pointer is *now*: inside the card (plus slack), or anywhere in the rectangle spanned by the anchor and the card, which is the path a pointer travelling towards it takes. `reanchor()` moves that rectangle's origin when an awaited card finally renders, so a slow response can't strand it.
